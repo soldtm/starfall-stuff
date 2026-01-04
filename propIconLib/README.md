@@ -1,2 +1,2 @@
 # propIconLib
-Library for efficient drawing models on screen
+Library for efficient drawing model icons
