@@ -1,0 +1,33 @@
+--@name propIconLib demo
+--@author soldnotsold
+--@client
+--@include propiconlib.txt
+
+require("propiconlib.txt")
+-- Less rendertargets = smaller icon size
+-- Library will fit all icons in this amount of rendertargets (each is 1024x1024)
+propIconLib.setRenderTargetLimit(1)
+
+//Library will calculate optimal view if it's not passed (similar to spawn menu)
+local cube = propIconLib.createModel("models/sprops/cuboids/height12/size_1/cube_12x12x12.mdl")
+local cupboard = propIconLib.createModel("models/props_c17/FurnitureCupboard001a.mdl")
+local can = propIconLib.createModel("models/props_junk/PopCan01a.mdl")
+local shelf = propIconLib.createModel("models/props_c17/shelfunit01a.mdl")
+local cargo = propIconLib.createModel("models/props_wasteland/cargo_container01.mdl")
+
+//custom view from spawnmenu
+local jet = propIconLib.createModel("models/xqm/jetbody3.mdl", '{"ang":"{8.069 90.3453 0}","pos":"[17.3425 -2877.4734 435.5033]","mdl_ang":"{0 0 0}","fov":4.204648934203271}')
+
+//Icons should be baked before drawing
+propIconLib.bakeIcons()
+
+
+hook.add("Render", "", function()
+    cube:draw(0,0, 128, 128) //x, y, width, height
+    cupboard:draw(128, 0, 128, 128) 
+    can:draw(256, 0, 128, 128) 
+    shelf:draw(384, 0, 128, 128)
+    cargo:draw(0,128, 128, 128)
+    jet:draw(128, 128, 128, 128) 
+end)
+

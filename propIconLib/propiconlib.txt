@@ -1,0 +1,375 @@
+--@name propIconLib
+--@author soldnotsold
+--@client
+
+// Settings //
+
+--Debug
+local DEBUG = false //Draws debug data if enabled
+
+// Init
+if DEBUG then
+    fontDebug = render.createFont("Arial",70,500,true,false,false,false,0,true,0)
+    fontDebugSm = render.createFont("Arial",16,500,true,false,false,false,0,true,0)
+    fontDebugLg = render.createFont("Arial",128,500,true,false,false,false,0,true,0)
+end
+
+propIconLib = {
+    models = {},
+    maxRenderTargets = 1,
+    isBaked = false,
+    chipId = chip():entIndex(),
+    drawHolo = nil,
+    materials = {},
+    lastLayout = {}
+}
+
+function propIconLib.resetHolo()
+    if propIconLib.drawHolo then
+        propIconLib.drawHolo:remove()
+    end
+    propIconLib.drawHolo = hologram.create(Vector(0,0,0), Angle(0,0,0), "models/holograms/cube.mdl")
+    propIconLib.drawHolo:setNoDraw(true)
+    propIconLib.drawHolo:suppressEngineLighting(true)
+end
+
+propIconLib.resetHolo()
+
+_drawableIcon = {}
+
+_drawableIcon.draw = function(self, x, y, w, h)
+    local model = self.model
+    if not model then 
+        if DEBUG then render.drawText(x,y,"Invalid model") end
+        return
+    end
+    
+    if not model.isBaked and DEBUG then
+        render.drawText(x,y,"Not baked!")
+        return
+    end
+    render.setMaterial(propIconLib.materials[model.rtCanvasIdx])
+
+
+    local startU = model.coords.x / 1024
+    local startV = model.coords.y / 1024
+    local endU = (model.coords.x+model.currentSize) / 1024  
+    local endV = (model.coords.y+model.currentSize) / 1024
+    
+    //render.drawTexturedRect(x,y, w,h)
+    render.drawTexturedRectUV(x, y, w, h, startU, startV, endU, endV)
+
+
+    render.setMaterial(nil)
+end
+
+
+
+propIconLib.__index = propIconLib
+
+function propIconLib.setRenderTargetLimit(limit)
+    if not isnumber(limit) or limit <=0 then return end
+    propIconLib.maxRenderTargets = limit
+end
+
+function propIconLib.parseGModIconSettings(text)
+    local data = json.decode(text)
+    local view = {}
+    view.fov = not data.fov and 5 or data.fov
+    view.origin = not data.pos and Vector(0,0,10) or data.pos
+    view.angles = not data.ang and Angle(20, -135, 0) or data.ang
+
+    return view
+end
+
+function propIconLib.createModel(modelPath, view, drawfunc)
+    if propIconLib.isBaked then
+    end
+    if view and isstring(view) then
+        view = propIconLib.parseGModIconSettings(view)
+    end
+    
+    propIconLib.models[#propIconLib.models+1] = {
+        model = modelPath,
+        view = view,
+        rtCanvasIdx = nil,
+        currentSize = nil,
+        coords = {x = nil, y=nil},
+        draw = propIconLib._draw,
+        drawfunc = drawfunc
+    }     
+    
+    return setmetatable({model = propIconLib.models[#propIconLib.models]}, {__index = _drawableIcon})
+end
+
+
+function propIconLib.calculateFOV(modelWidth, modelHeight, modelLength, viewAngle, cameraDistance, padding)
+    padding = padding or 0.2
+    
+    local angleRad = Angle(viewAngle.p, viewAngle.y, viewAngle.r)
+    angleRad.p = math.rad(angleRad.p)
+    angleRad.y = math.rad(angleRad.y)
+    angleRad.r = math.rad(angleRad.r)
+    
+    local effectiveWidth, effectiveHeight
+    
+    if math.abs(angleRad.p) < math.rad(45) then
+        effectiveWidth = modelWidth * math.cos(angleRad.y) + modelLength * math.sin(angleRad.y)
+        effectiveHeight = modelHeight * math.cos(angleRad.p) + modelLength * math.sin(angleRad.p)
+    else
+        effectiveWidth = modelWidth * math.cos(angleRad.y) + modelHeight * math.sin(angleRad.y)
+        effectiveHeight = modelHeight * math.cos(angleRad.p) + modelWidth * math.sin(angleRad.p)
+    end
+    
+    effectiveWidth = math.abs(effectiveWidth)
+    effectiveHeight = math.abs(effectiveHeight)
+    
+    local aspectRatio = 1
+    
+    local screenRelativeWidth = effectiveWidth / aspectRatio
+    local limitingDimension = math.max(effectiveHeight, screenRelativeWidth)
+    
+    local fovRadians = 2 * math.atan((limitingDimension * padding) / (2 * cameraDistance))
+    local fovDegrees = fovRadians * (180 / math.pi)
+    
+    return 5 + math.clamp(fovDegrees, 1, 175)
+end
+
+
+function propIconLib.calculateOptimalIconView(holo)
+    local mn, mx = holo:obbMins(), holo:obbMaxs()    
+    local middle = ( mn + mx ) * 0.5
+    local width = mx.x - mn.x
+    local length = mx.y - mn.y
+    local height = mx.z - mn.z
+    local size = 0
+    size = math.max( size, math.abs( mn.x ) + math.abs( mx.x ) )
+    size = math.max( size, math.abs( mn.y ) + math.abs( mx.y ) )
+    size = math.max( size, math.abs( mn.z ) + math.abs( mx.z ) )
+
+
+    local ViewAngle = Angle( 25, -135, 0 )
+    local ViewPos = holo:getPos() + ViewAngle:getForward() * size * -15
+    local cameraDistance = ViewPos:getDistance(Vector(0,0,0))
+    
+    local view = {}
+    view.fov = propIconLib.calculateFOV(width, height, length, ViewAngle, cameraDistance)
+    view.origin = ViewPos + (middle)
+    view.angles = ViewAngle
+    if DEBUG then
+        view.debug = {
+            size = size,
+            width = width,
+            height = height,
+            length = length,
+            fov = view.fov
+        }
+    end
+        
+    return view
+end
+
+
+function propIconLib.calculateLayout(totalIcons)
+    local maxIconSize = 512
+    local rtSize = 1024
+    
+    local maxCols = math.floor(rtSize / maxIconSize)
+    local maxRows = math.floor(rtSize / maxIconSize)
+    local maxIconsPerCanvas = maxCols * maxRows
+    
+    local minRenderTargets = math.ceil(totalIcons / maxIconsPerCanvas)
+    
+    if minRenderTargets <= propIconLib.maxRenderTargets then //fits
+        local actualRenderTargets = math.min(minRenderTargets, propIconLib.maxRenderTargets)
+        local iconsPerRenderTarget = math.ceil(totalIcons / actualRenderTargets)
+        local rows = math.ceil(iconsPerRenderTarget / maxCols)
+        
+        propIconLib.lastLayout = {
+            numRenderTargets = actualRenderTargets,
+            iconsPerRenderTarget = iconsPerRenderTarget,
+            grid = {cols = maxCols, rows = rows},
+            iconSize = maxIconSize,
+        }
+        return propIconLib.lastLayout
+    else
+        local iconsPerRenderTarget = math.ceil(totalIcons / propIconLib.maxRenderTargets)
+        
+        local cols = math.ceil(math.sqrt(iconsPerRenderTarget))
+        local rows = math.ceil(iconsPerRenderTarget / cols)
+        local iconSize = math.min(rtSize / cols, rtSize / rows)
+        propIconLib.lastLayout = {
+            numRenderTargets = propIconLib.maxRenderTargets,
+            iconsPerRenderTarget = iconsPerRenderTarget,
+            grid = {cols = cols, rows = rows},
+            iconSize = math.floor(iconSize),
+        }
+        
+        return propIconLib.lastLayout
+    end
+end
+
+
+function propIconLib.renderIcon(model)
+    //cleanup
+    render.clear(Color(0,0,0,0),true)
+    
+    local view
+    if model and model.view then
+        view = model.view
+        if DEBUG then
+            view.debug = {}
+            view.debug.isCustomView = true
+        end
+    else
+        view = propIconLib.calculateOptimalIconView(propIconLib.drawHolo)
+    end
+    
+        
+    view.type="3D"
+    view.aspect = 1
+    local debugdata
+    if DEBUG then
+        debugdata = view.debug
+        view.debug = nil
+    end
+    render.setColor(Color(255,255,255,255))
+    render.pushViewMatrix(view)
+    render.setLightingMode(1)
+    render.enableDepth(true)
+    propIconLib.drawHolo:draw()
+
+    render.setLightingMode(0)
+    render.enableDepth(false)
+    render.popViewMatrix()
+
+    
+    if DEBUG then
+        render.setFont(fontDebug)
+        if debugdata.isCustomView then
+            render.drawText(0,930, "Custom view")
+        else
+            render.drawText(0,830, "w: "..tostring(math.round(debugdata.width, 1)).." | h: ".. tostring(math.round(debugdata.height, 1)).." | l: "..tostring(math.round(debugdata.length, 1)).." fov: "..tostring(math.round(debugdata.fov, 2)))
+            render.drawText(0,900, "csize: "..tostring(math.round(debugdata.size, 2)))
+        end
+        
+        render.setColor(Color(255,0,0, 255))
+        render.drawRectOutline(1,1,1022,1022,4)
+        render.setColor(Color(255,255,255,255))
+        render.drawText(0,0, propIconLib.drawHolo:getModel())
+    end
+    
+end
+
+local rtName = "sns_propIconLib_iconRT_"..propIconLib.chipId
+render.createRenderTarget(rtName)
+
+local canvasBaseName = "sns_propIconLib_canvas_"..propIconLib.chipId
+
+function propIconLib.assignIcons(layout)
+    if not layout then
+        layout = propIconLib.calculateLayout(#propIconLib.models)
+    end
+    local currentRTIconIdx = 0
+    local currentCanvasRTIdx = 0
+    local currentCanvasRTName
+    for k, model in pairs(propIconLib.models) do    
+        if currentCanvasRTIdx == 0 or currentRTIconIdx >= layout.iconsPerRenderTarget then
+            currentRTIconIdx = 0
+            currentCanvasRTIdx = currentCanvasRTIdx + 1
+            currentCanvasRTName = canvasBaseName.."_"..currentCanvasRTIdx
+            if render.renderTargetExists(currentCanvasRTName) then 
+                render.destroyRenderTarget(currentCanvasRTName)
+            end
+            render.createRenderTarget(currentCanvasRTName)
+        end
+            
+        currentRTIconIdx = currentRTIconIdx +1
+        local row = math.floor((currentRTIconIdx - 1) / layout.grid.cols) 
+        local col = ((currentRTIconIdx - 1) % layout.grid.cols) 
+        
+        local x, y = col*layout.iconSize,layout.iconSize*row
+
+        model.rtCanvasIdx = currentCanvasRTIdx
+        model.currentSize = layout.iconSize 
+        model.coords = {x = x, y = y}
+    end
+    hook.add("RenderOffScreen", "sns_propIconLib_ClearRenderTarget", function()
+        for i=1, currentCanvasRTIdx do 
+            render.selectRenderTarget(canvasBaseName.."_"..i)
+            render.clear(Color(0,0,0,0), true)
+        end
+        hook.remove("RenderOffScreen", "sns_propIconLib_ClearRenderTarget")        
+    end)
+    return currentCanvasRTIdx
+end
+
+
+function propIconLib.createMaterials(materialsCount)
+    //destroy existing materials
+    for k, mat in pairs(propIconLib.materials) do
+        if isValid(mat) then mat:destroy() end
+    end
+    
+    for i=1, materialsCount do
+        local mat = material.create("UnlitGeneric")
+        mat:setTextureRenderTarget("$basetexture", canvasBaseName.."_"..i)
+        propIconLib.materials[#propIconLib.materials+1] = mat
+    end
+    
+end
+
+function propIconLib.bakeIcons()    
+    local modelsCount = #propIconLib.models
+    local layout = propIconLib.calculateLayout(modelsCount)
+    local lastMat = nil
+    local maxCanvas = 0
+    local clearedRTs = {}
+
+    local materialsCount = propIconLib.assignIcons(layout)    
+    propIconLib.createMaterials(materialsCount)     
+    local bufMat = material.create("UnlitGeneric")
+    timer.simple(3+(0.1*modelsCount), function() bufMat:destroy() end)
+    for k, model in pairs(propIconLib.models) do  
+        timer.simple(0.1*k, function()
+            propIconLib.resetHolo()
+            hook.add("RenderOffScreen", "sns_propIconLib_rendericons_"..propIconLib.chipId.."_"..k, function() 
+                propIconLib.drawHolo:setModel(model.model)
+                currentCanvasRTName = canvasBaseName.."_"..model.rtCanvasIdx
+                render.selectRenderTarget(currentCanvasRTName)
+                    
+                render.setColor(Color(255,255,255,255))
+        
+                local x, y = model.coords.x, model.coords.y
+                render.selectRenderTarget(rtName)   
+                render.clear(Color(0,0,0,0), true)
+                if model.drawfunc then model.drawfunc(propIconLib.drawHolo) end
+                propIconLib.renderIcon(model)
+
+                propIconLib.drawHolo:setColor(Color(255,255,255,255))
+                bufMat:setTextureRenderTarget("$basetexture", rtName)
+                    
+                render.selectRenderTarget(currentCanvasRTName)
+                
+                render.setMaterial(bufMat)
+                render.drawTexturedRect(x,y, model.currentSize, model.currentSize)
+                    
+                model.isBaked = true
+        
+                hook.remove("RenderOffScreen", "sns_propIconLib_rendericons_"..propIconLib.chipId.."_"..k)
+                hook.run("propIconLib_iconBaked", model)
+            end) 
+        end)
+        if k==modelsCount then 
+            propIconLib.isBaked = true
+            timer.simple(0.1*k+0.1, function()
+                hook.run("propIconLib_allIconsBaked")        
+            end)
+        end
+    end
+end
+
+
+
+
+
