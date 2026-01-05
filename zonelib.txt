@@ -1,0 +1,556 @@
+--@name ZoneLib
+--@author soldnotsold
+--@shared
+--@superuser
+
+local origprint = print
+function print(...)
+    if CLIENT and player() != chip():getOwner() then return end
+    return origprint(...)
+end
+
+zoneLib = {
+    checkRate = 0.1, 
+    zones = {}, 
+    holoModels = {
+        square = {
+            model = "models/holograms/cube.mdl",
+            size = 12
+        },
+        sphere = {
+            model = "models/holograms/hq_sphere.mdl",
+            size = 12
+        }
+    }  
+}
+
+function zoneLib.isEntityInBox(entity, corner1, corner2)
+    if not isValid(entity) then return false end
+    
+    local pos = entity:getPos()
+    
+    local min = Vector(
+        math.min(corner1.x, corner2.x),
+        math.min(corner1.y, corner2.y),
+        math.min(corner1.z, corner2.z)
+    )
+    local max = Vector(
+        math.max(corner1.x, corner2.x),
+        math.max(corner1.y, corner2.y),
+        math.max(corner1.z, corner2.z)
+    )
+    
+    return pos.x >= min.x and pos.x <= max.x
+        and pos.y >= min.y and pos.y <= max.y
+        and pos.z >= min.z and pos.z <= max.z
+end
+
+function zoneLib.isEntityInSphere(entity, center, radius)
+    if not isValid(entity) then return false end
+    
+    local pos = entity:getPos()
+    local distanceSqr = center:getDistanceSqr(pos)
+    
+    return distanceSqr <= (radius * radius)
+end
+
+zoneLib.Zone = class("Zone")
+
+function zoneLib.Zone:initialize(name)
+    self.name = name
+    self.entsInside = {}
+    self.lastKnownPositions = {}
+    self.nextCheck = timer.realtime()
+    self.parent = nil
+end
+
+function zoneLib.Zone:getCorners()
+    if self.zoneType == "box" then
+        local corners = {}
+        
+        if self.parent and isValid(self.parent) then
+            local localMin = Vector(
+                math.min(self.localPos1.x, self.localPos2.x),
+                math.min(self.localPos1.y, self.localPos2.y),
+                math.min(self.localPos1.z, self.localPos2.z)
+            )
+            local localMax = Vector(
+                math.max(self.localPos1.x, self.localPos2.x),
+                math.max(self.localPos1.y, self.localPos2.y),
+                math.max(self.localPos1.z, self.localPos2.z)
+            )
+            
+            local localCorners = {
+                Vector(localMin.x, localMin.y, localMin.z),
+                Vector(localMin.x, localMin.y, localMax.z),
+                Vector(localMin.x, localMax.y, localMin.z),
+                Vector(localMin.x, localMax.y, localMax.z),
+                Vector(localMax.x, localMin.y, localMin.z),
+                Vector(localMax.x, localMin.y, localMax.z),
+                Vector(localMax.x, localMax.y, localMin.z),
+                Vector(localMax.x, localMax.y, localMax.z)
+            }
+            
+            for i, localCorner in ipairs(localCorners) do
+                corners[i] = self.parent:localToWorld(localCorner)
+            end
+        else
+            local min = Vector(
+                math.min(self.pos1.x, self.pos2.x),
+                math.min(self.pos1.y, self.pos2.y),
+                math.min(self.pos1.z, self.pos2.z)
+            )
+            local max = Vector(
+                math.max(self.pos1.x, self.pos2.x),
+                math.max(self.pos1.y, self.pos2.y),
+                math.max(self.pos1.z, self.pos2.z)
+            )
+            
+            corners = {
+                Vector(min.x, min.y, min.z),
+                Vector(min.x, min.y, max.z),
+                Vector(min.x, max.y, min.z),
+                Vector(min.x, max.y, max.z),
+                Vector(max.x, min.y, min.z),
+                Vector(max.x, min.y, max.z),
+                Vector(max.x, max.y, min.z),
+                Vector(max.x, max.y, max.z)
+            }
+        end
+        
+        return corners
+    end
+    return {}
+end
+
+
+function zoneLib.Zone:updateWorldPositions()
+    if not self.parent or not isValid(self.parent) then
+        return false
+    end
+    
+    if self.zoneType == "sphere" then
+        self.center = self.parent:localToWorld(self.localCenter)
+        self.radius = self.localRadius
+        
+        self.pos1 = self.center - Vector(self.radius, self.radius, self.radius)
+        self.pos2 = self.center + Vector(self.radius, self.radius, self.radius)
+    else
+        self.pos1 = self.parent:localToWorld(self.localPos1)
+        self.pos2 = self.parent:localToWorld(self.localPos2)
+        self.center = (self.pos1 + self.pos2) / 2
+        
+        local min = Vector(
+            math.min(self.pos1.x, self.pos2.x),
+            math.min(self.pos1.y, self.pos2.y),
+            math.min(self.pos1.z, self.pos2.z)
+        )
+        local max = Vector(
+            math.max(self.pos1.x, self.pos2.x),
+            math.max(self.pos1.y, self.pos2.y),
+            math.max(self.pos1.z, self.pos2.z)
+        )
+        self.radius = min:getDistance(max) / 2
+    end
+    
+    return true
+end
+
+function zoneLib.Zone:containsPoint(point)
+    if self.zoneType == "sphere" then
+        return self.center:getDistanceSqr(point) <= (self.radius * self.radius)
+    else
+        return zoneLib.isEntityInBox({getPos = function() return point end}, self.pos1, self.pos2)
+    end
+end
+
+function zoneLib.Zone:containsEntity(entity)
+    if not isValid(entity) then return false end
+    
+    if self.zoneType == "sphere" then
+        return zoneLib.isEntityInSphere(entity, self.center, self.radius)
+    else
+        return zoneLib.isEntityInBox(entity, self.pos1, self.pos2)
+    end
+end
+
+function zoneLib.Zone:createHologram(modelType)
+    if not modelType then 
+        modelType = self.zoneType == "sphere" and "sphere" or "square"
+    end
+    
+    local holoModel = zoneLib.holoModels[modelType]
+    if not holoModel then return end
+    
+    if self.zoneType == "sphere" then
+        local scale = Vector(self.radius * 2 / holoModel.size)
+        local holo = hologram.create(self.center, Angle(0,0,0), holoModel.model, scale)
+        
+        if self.parent and isValid(self.parent) then
+            holo:setParent(self.parent)
+            holo:setPos(self.localCenter)
+        end
+        
+        holo:setColor(Color(255,255,255,180))
+        self.holo = holo
+        return holo
+    else
+        if self.parent and isValid(self.parent) then
+            local localPos = (self.localPos1 + self.localPos2) / 2
+            
+            local localMin = Vector(
+                math.min(self.localPos1.x, self.localPos2.x),
+                math.min(self.localPos1.y, self.localPos2.y),
+                math.min(self.localPos1.z, self.localPos2.z)
+            )
+            local localMax = Vector(
+                math.max(self.localPos1.x, self.localPos2.x),
+                math.max(self.localPos1.y, self.localPos2.y),
+                math.max(self.localPos1.z, self.localPos2.z)
+            )
+            local localSize = localMax - localMin
+            
+            local parentAng = self.parent:getAngles()
+            
+            local scale = localSize / holoModel.size
+            
+            local holo = hologram.create(self.center, parentAng, holoModel.model, scale)
+            
+            holo:setParent(self.parent)
+            holo:setPos(self.parent:localToWorld(localPos))
+            
+            holo:setColor(Color(255,255,255,180))
+            self.holo = holo
+            return holo
+        else
+            local min = Vector(
+                math.min(self.pos1.x, self.pos2.x),
+                math.min(self.pos1.y, self.pos2.y),
+                math.min(self.pos1.z, self.pos2.z)
+            )
+            local max = Vector(
+                math.max(self.pos1.x, self.pos2.x),
+                math.max(self.pos1.y, self.pos2.y),
+                math.max(self.pos1.z, self.pos2.z)
+            )
+            
+            local zoneSize = max - min
+            local scale = zoneSize / holoModel.size
+            
+            local position = (min + max) / 2
+            
+            local holo = hologram.create(position, Angle(0,0,0), holoModel.model, scale)
+            holo:setColor(Color(255,255,255,180))
+            self.holo = holo
+            return holo
+        end
+    end
+end
+
+
+function zoneLib.Zone:getNearestOutsidePosition(entityOrPos)
+    local pos
+    if type(entityOrPos) == "Vector" then
+        pos = entityOrPos
+    else
+        if not isValid(entityOrPos) then return nil end
+        pos = entityOrPos:getPos()
+    end
+    
+    local isInside = self:containsEntity(entityOrPos)
+    
+    if self.zoneType == "sphere" then
+        return self:getNearestOutsidePositionSphere(pos, isInside)
+    else
+        return self:getNearestOutsidePositionBox(pos, isInside)
+    end
+end
+
+function zoneLib.Zone:getNearestOutsidePositionSphere(pos, isInside)
+    local dir = pos - self.center
+    local distance = dir:getLength()
+    
+    if distance == 0 then
+        dir = Vector(0, 0, 1)
+        distance = 1
+    else
+        dir:normalize()
+    end
+    
+    local nearestOutside
+    
+    if isInside then
+        nearestOutside = self.center + dir * (self.radius + 0.1)
+    else
+        local distanceToCenter = distance
+        if distanceToCenter <= self.radius + 1 then
+            nearestOutside = self.center + dir * (self.radius + 1)
+        else
+            nearestOutside = pos
+        end
+    end
+    
+    return nearestOutside
+end
+
+function zoneLib.Zone:getNearestOutsidePositionBox(pos, isInside)
+    local min = Vector(
+        math.min(self.pos1.x, self.pos2.x),
+        math.min(self.pos1.y, self.pos2.y),
+        math.min(self.pos1.z, self.pos2.z)
+    )
+    local max = Vector(
+        math.max(self.pos1.x, self.pos2.x),
+        math.max(self.pos1.y, self.pos2.y),
+        math.max(self.pos1.z, self.pos2.z)
+    )
+    
+    if not isInside then
+        local margin = 1
+        if pos.x > min.x - margin and pos.x < max.x + margin and
+           pos.y > min.y - margin and pos.y < max.y + margin and
+           pos.z > min.z - margin and pos.z < max.z + margin then
+            isInside = false
+        else
+            return pos
+        end
+    end
+    
+    local distances = {
+        {axis = "x", side = -1, distance = pos.x - min.x, boundary = min.x},
+        {axis = "x", side = 1, distance = max.x - pos.x, boundary = max.x},
+        {axis = "y", side = -1, distance = pos.y - min.y, boundary = min.y},
+        {axis = "y", side = 1, distance = max.y - pos.y, boundary = max.y},
+        {axis = "z", side = -1, distance = pos.z - min.z, boundary = min.z},
+        {axis = "z", side = 1, distance = max.z - pos.z, boundary = max.z}
+    }
+    
+    table.sort(distances, function(a, b)
+        return a.distance < b.distance
+    end)
+    
+    local closest = distances[1]
+    
+    local nearestOutside = pos:clone()
+    
+    if closest.axis == "x" then
+        nearestOutside.x = closest.boundary + (closest.side * 0.1)
+        if pos.y < min.y then nearestOutside.y = min.y - 0.1
+        elseif pos.y > max.y then nearestOutside.y = max.y + 0.1 end
+        
+        if pos.z < min.z then nearestOutside.z = min.z - 0.1
+        elseif pos.z > max.z then nearestOutside.z = max.z + 0.1 end
+        
+    elseif closest.axis == "y" then
+        nearestOutside.y = closest.boundary + (closest.side * 0.1)
+        if pos.x < min.x then nearestOutside.x = min.x - 0.1
+        elseif pos.x > max.x then nearestOutside.x = max.x + 0.1 end
+        
+        if pos.z < min.z then nearestOutside.z = min.z - 0.1
+        elseif pos.z > max.z then nearestOutside.z = max.z + 0.1 end
+        
+    else
+        nearestOutside.z = closest.boundary + (closest.side * 0.1)
+        if pos.x < min.x then nearestOutside.x = min.x - 0.1
+        elseif pos.x > max.x then nearestOutside.x = max.x + 0.1 end
+        
+        if pos.y < min.y then nearestOutside.y = min.y - 0.1
+        elseif pos.y > max.y then nearestOutside.y = max.y + 0.1 end
+    end
+    
+    return nearestOutside
+end
+
+function zoneLib.createBoxZone(vec1, vec2, name)
+    if not name then name = "zoneLib_zone_"..math.round(timer.curtime()) end
+    
+    local zone = zoneLib.Zone:new(name)
+    zone.zoneType = "box"
+    zone.pos1 = vec1
+    zone.pos2 = vec2
+    zone.center = (vec1 + vec2) / 2
+    
+    local min = Vector(
+        math.min(vec1.x, vec2.x),
+        math.min(vec1.y, vec2.y),
+        math.min(vec1.z, vec2.z)
+    )
+    local max = Vector(
+        math.max(vec1.x, vec2.x),
+        math.max(vec1.y, vec2.y),
+        math.max(vec1.z, vec2.z)
+    )
+    zone.radius = min:getDistance(max) / 2
+    
+    zoneLib.zones[#zoneLib.zones+1] = zone
+    return zone 
+end
+
+function zoneLib.createSphereZone(center, radius, name)
+    if not name then name = "zoneLib_sphere_"..math.round(timer.curtime()) end
+    
+    local zone = zoneLib.Zone:new(name)
+    zone.zoneType = "sphere"
+    zone.center = center
+    zone.radius = radius
+    zone.pos1 = center - Vector(radius, radius, radius)
+    zone.pos2 = center + Vector(radius, radius, radius)
+    
+    zoneLib.zones[#zoneLib.zones+1] = zone
+    return zone 
+end
+
+-- Parented zone creation functions
+function zoneLib.createParentedBoxZone(parent, localMin, localMax, name)
+    if not name then name = "zoneLib_parented_box_"..math.round(timer.curtime()) end
+    
+    if not isValid(parent) then
+        error("Parent is not valid")
+        return nil
+    end
+    
+    local zone = zoneLib.Zone:new(name)
+    zone.zoneType = "box"
+    zone.parent = parent
+    zone.localPos1 = localMin
+    zone.localPos2 = localMax
+    
+    zone:updateWorldPositions()
+    
+    zoneLib.zones[#zoneLib.zones+1] = zone
+    return zone 
+end
+
+function zoneLib.createParentedSphereZone(parent, localCenter, radius, name)
+    if not name then name = "zoneLib_parented_sphere_"..math.round(timer.curtime()) end
+    
+    if not isValid(parent) then
+        error("Parent entity is not valid")
+        return nil
+    end
+    
+    local zone = zoneLib.Zone:new(name)
+    zone.zoneType = "sphere"
+    zone.parent = parent
+    zone.localCenter = localCenter
+    zone.localRadius = radius
+    
+    zone:updateWorldPositions()
+    
+    zoneLib.zones[#zoneLib.zones+1] = zone
+    return zone 
+end
+
+-- Event hooks
+function zoneLib.Zone:_onPlayerEnter(ply) 
+    self:onPlayerEnter(ply)
+end
+
+function zoneLib.Zone:_onEntityEnter(ent)
+    self:onEntityEnter(ent)
+end
+
+function zoneLib.Zone:_onPlayerLeave(ply)
+    self:onPlayerLeave(ply)    
+end
+
+function zoneLib.Zone:_onEntityLeave(ent)
+    self:onEntityLeave(ent)    
+end
+
+function zoneLib.Zone:_entThink(ent)
+   self:entThink(ent) 
+end
+
+function zoneLib.Zone:_think()
+    self:think()
+end
+
+-- Overridable methods
+function zoneLib.Zone:onPlayerEnter(ply)
+    -- overridable    
+end
+
+function zoneLib.Zone:onEntityEnter(ent)
+    -- overridable
+end
+
+function zoneLib.Zone:onPlayerLeave(ply)
+    -- overridable
+end
+
+function zoneLib.Zone:onEntityLeave(ent)
+    -- overridable
+end
+
+function zoneLib.Zone:entThink(ent)
+    -- overridable
+end
+
+function zoneLib.Zone:think()
+    -- overridable
+end
+
+hook.add("Think", "zoneLib_zones_monitor", function()
+    local curTime = timer.realtime()    
+    for num, zone in pairs(zoneLib.zones) do
+        if zone.nextCheck > curTime then continue end
+        zone.nextCheck = curTime + zoneLib.checkRate
+        
+        -- Update world positions for parented zones
+        if zone.parent and isValid(zone.parent) then
+            zone:updateWorldPositions()
+        end
+        
+        local foundEnts
+        if zone.zoneType == "sphere" then
+            foundEnts = find.inSphere(zone.center, zone.radius)
+        else
+            foundEnts = find.inBox(zone.pos1, zone.pos2)
+        end
+        
+        local foundCount = #foundEnts
+        local currentCount = table.count(zone.entsInside)
+        
+        if foundCount == 0 and currentCount == 0 then continue end
+        
+        local foundLookup = {}
+        for i = 1, foundCount do
+            local ent = foundEnts[i]
+            if isValid(ent) then
+                zone:_entThink(ent)
+                foundLookup[ent:entIndex()] = ent
+            end
+        end
+        
+        for entIndex, ent in pairs(foundLookup) do
+            if not zone.entsInside[entIndex] then
+                zone.entsInside[entIndex] = ent
+            
+                if ent:isPlayer() then
+                    zone:_onPlayerEnter(ent)
+                else
+                    zone:_onEntityEnter(ent)
+                end
+            end
+        end
+        
+        if foundCount ~= currentCount or currentCount > 0 then
+            for entIndex, prevEntity in pairs(zone.entsInside) do
+                if not foundLookup[entIndex] then
+                    zone.entsInside[entIndex] = nil
+                    
+                    if isValid(prevEntity) then
+                        if prevEntity:isPlayer() then
+                            zone:_onPlayerLeave(prevEntity)
+                        else
+                            zone:_onEntityLeave(prevEntity)
+                        end
+                    end
+                end
+            end
+        end
+        
+        zone:_think()
+    end
+end)
