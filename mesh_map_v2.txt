@@ -1,0 +1,506 @@
+--@name mesh map v2
+--@author soldnotsold, legokidlogan
+--@client
+//my attempt to draw mesh of the map fast
+//displacements are not drawn because https://github.com/Facepunch/garrysmod-issues/issues/5677
+//mesh coloring code eventually copied from lkl
+
+//settings
+local WIREFRAME_MODE = false
+local FULLBRIGHT_MODE = false
+local MESH_SCALE = Vector(0.05)
+local DOWNSCALE_FACTOR = 100 / (1 / MESH_SCALE.x)
+local MESH_OFFSET = Vector(0)
+
+
+local math = math
+local cpuAverage, cpuMax = cpuAverage, cpuMax
+local min, abs = math.min, math.abs
+local table = table
+
+//const
+local VERT_GROUP_SIZE_LIMIT = 65535
+local VERT_GROUP_SIZE_LIMIT_SOFT = VERT_GROUP_SIZE_LIMIT - 3 * 100
+local NAME = "Mesh Map v2"    
+local FALLBACK_COLOR  = Color(0, 255, 100, 255)     
+local COLOR_WHITE = Color(255,255,255,255)     
+local WATER_COLOR = Color( 20, 110, 220 )
+local COLOR_BLACK = Color( 0, 0, 0, 255 )
+local CLIENT_CPU_LIMIT = 0.4
+local SURFACES_BATCH_SIZE = math.floor(1024*cpuMax())
+if SURFACES_BATCH_SIZE % 2 != 0 then SURFACES_BATCH_SIZE = SURFACES_BATCH_SIZE+1 end
+
+
+//setup 
+local world = game.getWorld()
+local surfaceCountMinusOne = world:getBrushPlaneCount() - 1
+local mapBrushSurfaces = world:getBrushSurfaces()
+local mapBrushSurfacesCount = #mapBrushSurfaces
+local SURFACES_PERC = mapBrushSurfacesCount/100
+local verticesBatches = {}
+local meshes = {}
+local currentSurface = -1
+local currentSurfaceMaterial = 0
+local meshHolos = {}
+local meshMaterial = nil
+local rtNameMeshMat = "rt_mesh_map_mat"
+local rtNameCopyMat = "rt_mesh_map_mat_copy"
+
+local mapMaterialsColors = {}
+local mapMaterialsByName = {}
+local isMeshesDataReady = false
+local mapBrushSurfacesToProcessMaterial = world:getBrushSurfaces()
+local isMapMaterialsProcessingFinished = false
+
+local verticesBuf = {}
+
+local curVertGroup = {}
+local curVertGroupSize = 0
+local vertGroups = { curVertGroup }
+//bloat
+
+
+local meshMapColorMode2CompressionScale =  1 / 8 -- When using color mode 2, downscales the texture before sampling it. Helps with noisy textures like grass.
+local meshMapColorMode2NumSamples = 50 -- When using color mode 2, how many pixels to sample per material.
+
+
+
+function updateProgress()
+    local status = ""
+    if not isMapMaterialsProcessingFinished then 
+        status = "colors "..currentSurfaceMaterial.."/"..mapBrushSurfacesCount.." ["..math.floor(currentSurfaceMaterial/SURFACES_PERC, 2).."%]"
+    end 
+    if isMapMaterialsProcessingFinished and not isMeshesDataReady then
+        status = "meshes data "..currentSurface.."/"..mapBrushSurfacesCount.." ["..math.floor(currentSurface/SURFACES_PERC, 2).."%]"
+    end
+    
+    setName(NAME.." "..status)    
+end
+
+local function getCachedSurfaceMaterial( surface )
+    local surfaceMaterial = surface:getMaterial()
+    local surfaceMatName = istable( surfaceMaterial ) and surfaceMaterial:getName() or surfaceMaterial
+    local surfaceMapCached = mapMaterialsByName[surfaceMatName]
+
+    if surfaceMapCached then
+        return surfaceMapCached
+    end
+
+    mapMaterialsByName[surfaceMatName] = surfaceMaterial
+
+    return surfaceMaterial
+end
+
+local function cacheNextSurfaceMaterial()
+    local surface = table.remove(mapBrushSurfacesToProcessMaterial)
+    if not surface then
+        hook.remove( "renderoffscreen", "PrepareMapMatColors" )
+        isMapMaterialsProcessingFinished = true
+        hook.run("ColorsCalcFinished")
+        return
+    end
+    
+    updateProgress()
+    currentSurfaceMaterial = currentSurfaceMaterial + 1
+    
+    
+    local surfaceMat = getCachedSurfaceMaterial( surface )
+    if mapMaterialsColors[surfaceMat] then return true end -- Already cached.
+
+    local texture = surfaceMat:getTexture( "$basetexture" )
+
+    if texture then
+        textureCopyMat:setTexture( "$basetexture", surfaceMat:getTexture( "$basetexture" ) )
+    end
+
+    textureCopyMat:setVector( "$color", surfaceMat:getVector( "$color" ) )
+    textureCopyMat:setVector( "$color2", surfaceMat:getVector( "$color2" ) )
+
+    local ignoreBlack = surface.ignoreBlack
+    local samplesEff = surface.sampleCountOverride or meshMapColorMode2NumSamples
+    local width = math.ceil( ( surfaceMat:getWidth() - 1 ) * meshMapColorMode2CompressionScale )
+    local height = math.ceil( ( surfaceMat:getHeight() - 1 ) * meshMapColorMode2CompressionScale )
+       local rSum = 0
+    local gSum = 0
+    local bSum = 0
+
+    render.selectRenderTarget( rtNameCopyMat )
+
+    -- Draw material onto render target.
+    render.clear( COLOR_BLACK )
+    render.setMaterial( textureCopyMat )
+
+    if meshMapColorMode2CompressionScale == 1 then
+        render.drawTexturedRectFast( 0, 0, width, height )
+    else
+        render.drawTexturedRectUVFast( 0, 0, width, height, 0, 0, 1, 1 )
+    end
+
+    -- Read pixels from render target. Unfortunately, this is the only option, as material:getColor() doesn't work on vtf textures.
+    render.capturePixels()
+
+    for _ = 1, samplesEff do
+        local x = math.random( 0, width )
+        local y = math.random( 0, height )
+        local color = render.readPixel( x, y )
+
+        if ignoreBlack and color == COLOR_BLACK then
+            samplesEff = samplesEff - 1
+        else
+            rSum = rSum + color.r
+            gSum = gSum + color.g
+            bSum = bSum + color.b
+        end
+    end
+
+    render.selectRenderTarget()
+
+    local avgColor = samplesEff == 0 and Color( 0, 0, 0, 255 ) or Color(
+        rSum / samplesEff,
+        gSum / samplesEff,
+        bSum / samplesEff,
+        255
+    )
+
+    mapMaterialsColors[surfaceMat] = avgColor
+
+    return true
+    
+end
+
+
+
+hook.add( "renderoffscreen", "SetupMeshMaterial", function()
+    render.selectRenderTarget( rtNameMeshMat )
+    render.clear( Color( 255, 255, 255, 255 ) )
+    render.selectRenderTarget()
+
+    hook.remove( "renderoffscreen", "SetupMeshMaterial" )
+end )
+
+
+do
+    render.createRenderTarget( rtNameMeshMat )
+    meshMat = material.create( "UnlitGeneric" )
+    meshMat:setTextureRenderTarget( "$basetexture", rtNameMeshMat )
+    meshMat:setInt( "$flags", 16 + 2048 + ( WIREFRAME_MODE and 268435456 or 0 ) )
+end
+
+
+textureCopyMat = material.create("UnlitGeneric")
+render.createRenderTarget("rt_mesh_map_mat_copy")
+
+function getMapMaterialColor( pos, surfaceCenter, surfaceNormal, _surfaceInd, surfaceMat )
+
+    local color = mapMaterialsColors[surfaceMat] or FALLBACK_COLOR
+    if FULLBRIGHT_MODE then return color end
+
+    pos = surfaceCenter + surfaceNormal * 5
+
+    local vertLight = render.computeLighting( pos, surfaceNormal )
+    local combinedBrightness = vertLight:getLength() / 3
+    local brightnessMult = istable( surfaceMat ) and surfaceMat.brightnessMult
+
+
+
+    if brightnessMult then
+        combinedBrightness = combinedBrightness * brightnessMult
+    end
+
+    combinedBrightness = math.max(combinedBrightness, 0.05)
+    combinedBrightness = math.clamp( combinedBrightness, 0, 1 ) ^ 0.3
+
+    return Color(
+        color.r * combinedBrightness,
+        color.g * combinedBrightness,
+        color.b * combinedBrightness,
+        255
+    )
+    
+end
+
+
+-- Returns the min and max bounds of a table or vararg of Vectors.
+function getMinMaxPiecewise( points, ... )
+    if type( points ) == "Vector" then
+        points = { points, ... }
+    end
+
+    local pointCount = #points
+    if pointCount == 0 then return nil end
+    if pointCount == 1 then return points[1]:clone() end
+
+    local minX = math.huge
+    local minY = math.huge
+    local minZ = math.huge
+    local maxX = -math.huge
+    local maxY = -math.huge
+    local maxZ = -math.huge
+
+    for i = 1, pointCount do
+        local point = points[i]
+        local x = point[1]
+        local y = point[2]
+        local z = point[3]
+
+        if x < minX then minX = x end
+        if x > maxX then maxX = x end
+        if y < minY then minY = y end
+        if y > maxY then maxY = y end
+        if z < minZ then minZ = z end
+        if z > maxZ then maxZ = z end
+    end
+
+    return Vector( minX, minY, minZ ), Vector( maxX, maxY, maxZ )
+end
+
+function getCenter( points, ... )
+    local min, max = getMinMaxPiecewise( points, ... )
+
+    return ( min + max ) / 2
+end
+
+
+function processSurface()
+        currentSurface = currentSurface + 1
+        local surface = mapBrushSurfaces[currentSurface]
+        if not surface then print("shit") return end
+        if surface:isSky() or surface:isNoDraw() then
+            return 
+        end
+        
+        updateProgress()
+
+        local totalTris = 0
+        for _, vertGroup in ipairs( vertGroups ) do
+            totalTris = totalTris + #vertGroup / 3
+        end
+
+        if mesh.trianglesLeft() - totalTris <= 10 then return end
+
+        if surface:isNoDraw() then return end
+        if surface:isSky() then return end
+
+        local surfaceVerts = surface:getVertices()
+        local surfaceVertCount = #surfaceVerts
+
+
+        if surfaceVertCount < 3 then return end
+
+
+        local surfaceInd = currentSurface
+        local surfaceNormal
+
+
+        _, surfaceNormal = world:getBrushPlane( surfaceInd-1 )
+   
+
+        local isWater = surface:isWater()
+        local overrideColor = surface.overrideColor
+        local surfaceMat = getCachedSurfaceMaterial( surface )
+
+        if not overrideColor then
+            if isWater then
+                overrideColor = WATER_COLOR
+            elseif surface:isSky() then
+                overrideColor = FALLBACK_COLOR
+            elseif surface:isNoDraw() then
+                overrideColor = FALLBACK_COLOR
+            end
+        end
+
+        if curVertGroupSize >= VERT_GROUP_SIZE_LIMIT_SOFT then
+            curVertGroup = {}
+            curVertGroupSize = 0
+            vertGroups[#vertGroups+1] = curVertGroup
+            //table.insert( vertGroups, curVertGroup )
+        end
+
+
+        local surfaceCenter = getCenter( surfaceVerts )
+
+        if surfaceVertCount == 3 then
+            for i = 1, surfaceVertCount do
+                local pos = surfaceVerts[i]
+                
+
+                curVertGroupSize = curVertGroupSize + 1
+                curVertGroup[curVertGroupSize] = {
+                    pos = pos * MESH_SCALE + MESH_OFFSET,
+                    color = overrideColor or getMapMaterialColor( pos, surfaceCenter, surfaceNormal, surfaceInd, surfaceMat ),
+                }
+            end
+        else
+            local firstVert = surfaceVerts[1]
+            local prevVert = surfaceVerts[3]
+
+            local firstColor = overrideColor or getMapMaterialColor( firstVert, surfaceCenter, surfaceNormal, surfaceInd, surfaceMat )
+            local prevColor = overrideColor or getMapMaterialColor( prevVert, surfaceCenter, surfaceNormal, surfaceInd, surfaceMat )
+
+            firstVert = firstVert * MESH_SCALE + MESH_OFFSET
+            prevVert = prevVert * MESH_SCALE + MESH_OFFSET
+
+            curVertGroupSize = curVertGroupSize + 1
+            curVertGroup[curVertGroupSize] = {
+                pos = firstVert,
+                color = firstColor,
+            }
+
+            local vert2 = surfaceVerts[2]
+            local color2 = overrideColor or getMapMaterialColor( vert2, surfaceCenter, surfaceNormal, surfaceInd, surfaceMat )
+            vert2 = vert2 * MESH_SCALE + MESH_OFFSET
+
+            curVertGroupSize = curVertGroupSize + 1
+            curVertGroup[curVertGroupSize] = {
+                pos = vert2,
+                color = color2,
+            }
+
+            curVertGroupSize = curVertGroupSize + 1
+            curVertGroup[curVertGroupSize] = {
+                pos = prevVert,
+                color = prevColor,
+
+            }
+
+            for i = 4, surfaceVertCount do
+                local vert = surfaceVerts[i]
+                local color = overrideColor or getMapMaterialColor( vert, surfaceCenter, surfaceNormal, surfaceInd, surfaceMat )
+                vert = vert * MESH_SCALE + MESH_OFFSET
+
+                curVertGroupSize = curVertGroupSize + 1
+                curVertGroup[curVertGroupSize] = {
+                    pos = firstVert,
+                    color = firstColor,
+                }
+
+                curVertGroupSize = curVertGroupSize + 1
+                curVertGroup[curVertGroupSize] = {
+                    pos = prevVert,
+                    color = prevColor,
+
+                }
+
+                curVertGroupSize = curVertGroupSize + 1
+                curVertGroup[curVertGroupSize] = {
+                    pos = vert,
+                    color = color,
+
+                }
+
+                prevVert = vert
+                prevColor = color
+
+            end
+        end
+
+end
+ 
+
+local surfacesPerThink = math.floor(2048*cpuMax())
+if surfacesPerThink % 2 != 0 then surfacesPerThink = surfacesPerThink end
+
+local generateMeshData = coroutine.wrap(function()
+    while !isMeshesDataReady do
+        if cpuAverage() > cpuMax() * CLIENT_CPU_LIMIT / surfacesPerThink *2  then                       
+            for i = currentSurface, math.min(currentSurface + surfacesPerThink - 1, #mapBrushSurfaces) do
+                processSurface()
+                
+            end
+            if currentSurface > #mapBrushSurfaces then
+                hook.run("MeshDataGenerated")
+                isMeshesDataReady = true
+
+                    hook.remove("Tick", "GenerateMeshData")
+            end     
+            coroutine.yield()
+        end
+    end
+end)
+
+local createMeshHolos = coroutine.create(function()
+    print("ran createMeshHolos")
+
+    for k, batch in pairs(vertGroups) do
+            local holo = hologram.create(
+                chip():localToWorld(Vector(0,0, 0)),
+                chip():localToWorldAngles(Angle(0, 0, 0)),
+                "models/hologram/hologram.mdl"
+            )
+            local createdMesh = mesh.createFromTable(batch, true)
+            meshes[#meshes+1] = createdMesh
+            holo:setMesh(createdMesh)
+            holo:setMeshMaterial(meshMat)
+            //holo:setScale(MESH_SCALE)
+            holo:setParent(chip())
+            holo:setRenderBounds(Vector(-1000),Vector(1000))
+            meshHolos[#meshHolos+1] = holo
+            print("holo "..k.." created")
+    end
+end)
+
+
+
+local playerHolos = {}
+function createPlayerHolo(ply)
+    print("created holo for"..ply:getName())
+    playerHolos[ply] = hologram.create(Vector(0,0,0), Angle(0,0,0), "models/holograms/hq_icosphere.mdl")
+    playerHolos[ply]:setParent(chip())
+    if ply == player() then
+        playerHolos[ply]:setColor(Color(255,0,0))
+        playerHolos[ply]:setScale(Vector(ply:getModelScale()*0.15))
+    else
+        playerHolos[ply]:setScale(Vector(ply:getModelScale()*0.15))
+    end
+    playerHolos[ply]:setModel(ply:getModel())
+        playerHolos[ply]:setAnimation("walk_all",1,0)
+
+
+end
+
+
+hook.add("MeshDataGenerated", "MeshDataGeneratedTrigger", function()
+    print("mesh data generated")  
+
+    
+    hook.add("Think", "holos", function()
+        if coroutine.status(createMeshHolos) ~= "dead" then
+            data =  coroutine.resume(createMeshHolos)
+            if data == nil then hook.remove("Think", "holos") hook.run("MeshHolosFinalized") return end
+        end
+    end)
+    
+    
+end)
+
+hook.add( "renderoffscreen", "PrepareMapMatColors", function()
+
+    local otherUsage = cpuTotalAverage() - cpuAverage()
+    local perfLimit = cpuMax() * CLIENT_CPU_LIMIT - otherUsage
+
+    for _ = 1, 100 do
+        if cpuAverage() > perfLimit then return end
+        if not cacheNextSurfaceMaterial() then return end
+    end
+end )
+
+hook.add("ColorsCalcFinished", "", function()
+    hook.add("Tick", "GenerateMeshData", generateMeshData)
+end)
+
+
+hook.add("MeshHolosFinalized", "", function()
+    print("mesh holos finalized, drawing players")
+    timer.create("plys", 0.1, 0, function()
+        local players = find.allPlayers()
+        for _, ply in pairs(players) do
+            if not playerHolos[ply] then
+                createPlayerHolo(ply)
+            else
+                playerHolos[ply]:setPos(chip():localToWorld(ply:getPos()*MESH_SCALE+Vector(0,0,0)))
+                playerHolos[ply]:setAngles(ply:getAngles())
+            end
+        end
+    end)
+    
+end)
