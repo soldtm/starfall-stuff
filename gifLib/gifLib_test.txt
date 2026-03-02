@@ -1,0 +1,18 @@
+--@name gifLib test
+--@author soldnotsold
+--@client
+--@include giflib.txt
+
+require("giflib.txt")
+
+local testgif = gifLib.GIF:new("https://raw.githubusercontent.com/soldtm/starfall-stuff/refs/heads/main/gifLib/gman.gif_converted.png", 182.12571428571428, 102.39999999999999, 5, 49, 24.019607843137255)
+local w, h = testgif:rescale(512)
+
+hook.add("Render", "", function()
+    render.setColor(Color(255,255,255,255))
+    render.drawRectFast(0,0, 512, 512)
+    testgif:draw(0,0, w, h)
+    render.setColor(Color(255,0,0))
+    render.drawText(0,0, "frame: "..testgif.currentFrame)
+    render.setColor(Color(255,255,255))
+end)
