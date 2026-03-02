@@ -1,0 +1,58 @@
+--@name gifLib
+--@author soldnotsold
+--@client
+
+gifLib = {}
+
+---@class gifLib.GIF
+gifLib.GIF = class("gifLib.GIF")
+
+function gifLib.GIF:initialize(url, frameW, frameH, cols, totalFrames, fps)
+    self.frameW = frameW 
+    self.frameH = frameH
+    self.cols = cols
+    self.totalFrames = totalFrames
+    self.fps = fps or 10
+    self.delta = 1 / self.fps
+
+    self.atlasSize = 1024
+    self.currentFrame = 0
+    self.nextChange = 0
+    self.ready = false
+    
+    self:loadTexture(url)
+end
+
+function gifLib.GIF:loadTexture(url)
+    self.material = material.create("UnlitGeneric")
+    self.material:setTextureURL("$basetexture", url, function(success)
+        if success then self.ready = true end
+    end)
+end
+
+function gifLib.GIF:rescale(width)
+    local newH = width * self.frameH / self.frameW
+    newH = math.floor(newH + 0.5)
+    return width, newH
+end
+
+function gifLib.GIF:draw(x, y, w, h)
+    if not self.ready then return end
+
+    local now = timer.curtime()
+    if now >= self.nextChange then
+        self.nextChange = now + self.delta
+        self.currentFrame = (self.currentFrame + 1) % self.totalFrames
+    end
+
+    local col = self.currentFrame % self.cols
+    local row = math.floor(self.currentFrame / self.cols)
+    
+    local u1 = (col * self.frameW) / self.atlasSize
+    local v1 = (row * self.frameH) / self.atlasSize
+    local u2 = u1 + (self.frameW / self.atlasSize)
+    local v2 = v1 + (self.frameH / self.atlasSize)
+
+    render.setMaterial(self.material)
+    render.drawTexturedRectUV(x, y, w, h, u1, v1, u2, v2)
+end
